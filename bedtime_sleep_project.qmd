@@ -1,0 +1,1198 @@
+---
+title: "Bedtime Screen Time, Sleep Debt, and Next-Day Fatigue"
+subtitle: "A Multi-Model Machine Learning Analysis"
+
+---
+
+# Section 1 — Project Overview
+
+## 1.1 Research Objective
+
+This project studies how bedtime screen behavior, lifestyle factors, and sleep characteristics are associated with sleep quality and next-day outcomes.
+
+The analysis is organized around five complementary research questions:
+
+1. **RQ1 — Sleep Latency:** Can pre-sleep behavior predict how long it takes a person to fall asleep?
+2. **RQ2 — Sleep Duration:** Can pre-sleep behavior predict total sleep duration?
+3. **RQ3 — Sleep Debt:** Can pre-sleep and lifestyle variables classify a person's sleep-debt category?
+4. **RQ4 — Next-Day Fatigue:** How much does fatigue prediction improve when actual sleep outcomes are added to behavioral information?
+5. **RQ5 — Behavioral Profiles:** Can unsupervised learning identify distinct bedtime and sleep profiles?
+
+The project compares multiple models rather than assuming that one algorithm is always best. Model selection is based on held-out test performance after a consistent train/test split.
+
+> **Interpretation note:** This is an observational dataset. Predictive relationships and feature importance should not be interpreted as proof that a variable causes a sleep outcome.
+
+# Section 2 — Setup and Data Preparation
+
+## 2.1 Import Libraries
+
+```{python}
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+
+from sklearn.linear_model import Ridge, LogisticRegression
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report,
+    ConfusionMatrixDisplay,
+    silhouette_score
+)
+from sklearn.inspection import permutation_importance
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+
+RANDOM_STATE = 42
+pd.set_option("display.max_columns", 100)
+```
+
+## 2.2 Load the Dataset
+
+Keep the CSV file in the same folder as this QMD file.
+
+```{python}
+DATA_PATH = "bedtime_screentime_sleep_debt.csv"
+
+df = pd.read_csv(DATA_PATH)
+
+print("Dataset shape:", df.shape)
+display(df.head())
+```
+
+## 2.3 Data Quality Check
+
+```{python}
+print("Duplicate rows:", df.duplicated().sum())
+print("\nMissing values:")
+display(df.isna().sum().to_frame("missing_values"))
+
+print("\nData types:")
+display(df.dtypes.to_frame("dtype"))
+
+print("\nDescriptive statistics:")
+display(df.drop(columns=["user_id"], errors="ignore").describe(include="all").T)
+```
+
+`user_id` is an identifier rather than a behavioral characteristic, so it is excluded from all predictive models.
+
+The dataset contains both variables that exist **before sleep** (for example, phone use, brightness, caffeine, and physical activity) and variables observed **after or during sleep** (for example, total sleep hours and sleep stages). Keeping this timing distinction is important for reducing target leakage.
+
+## 2.4 Target and Category Distributions
+
+```{python}
+sleep_debt_order = [
+    "Optimal Recovery",
+    "Mild Deficit",
+    "Moderate Debt",
+    "Severe Sleep Debt"
+]
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+# Sleep debt categories in severity order
+df["sleep_debt_category"].value_counts().reindex(sleep_debt_order).plot(
+    kind="bar",
+    ax=axes[0],
+    title="Sleep Debt Category Distribution"
+)
+
+axes[0].set_xlabel("Sleep Debt Category")
+axes[0].set_ylabel("Count")
+axes[0].tick_params(axis="x", rotation=30)
+
+# Next-day fatigue distribution
+axes[1].hist(
+    df["next_day_fatigue_score"],
+    bins=18,
+    edgecolor="black"
+)
+
+axes[1].set_title("Distribution of Next-Day Fatigue")
+axes[1].set_xlabel("Fatigue Score")
+axes[1].set_ylabel("Count")
+
+plt.tight_layout()
+plt.show()
+```
+
+
+## 2.6 Reusable Modeling Functions
+
+```{python}
+def make_preprocessor(X, scale_numeric=False):
+    numeric_features = X.select_dtypes(include=np.number).columns.tolist()
+    categorical_features = X.select_dtypes(exclude=np.number).columns.tolist()
+
+    numeric_steps = [
+        ("imputer", SimpleImputer(strategy="median"))
+    ]
+    if scale_numeric:
+        numeric_steps.append(("scaler", StandardScaler()))
+
+    numeric_transformer = Pipeline(numeric_steps)
+
+    categorical_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ])
+
+    return ColumnTransformer([
+        ("num", numeric_transformer, numeric_features),
+        ("cat", categorical_transformer, categorical_features)
+    ])
+
+
+def evaluate_regression_models(X, y):
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, random_state=RANDOM_STATE
+    )
+
+    models = {
+        "Ridge": Ridge(alpha=1.0),
+        "Random Forest": RandomForestRegressor(
+            n_estimators=300,
+            min_samples_leaf=3,
+            random_state=RANDOM_STATE,
+            n_jobs=-1
+        ),
+        "Extra Trees": ExtraTreesRegressor(
+            n_estimators=300,
+            min_samples_leaf=2,
+            random_state=RANDOM_STATE,
+            n_jobs=-1
+        )
+    }
+
+    results = []
+    fitted = {}
+
+    for name, model in models.items():
+        pipe = Pipeline([
+            ("preprocessor", make_preprocessor(X, scale_numeric=(name == "Ridge"))),
+            ("model", model)
+        ])
+
+        pipe.fit(X_train, y_train)
+        pred = pipe.predict(X_test)
+
+        results.append({
+            "Model": name,
+            "MAE": mean_absolute_error(y_test, pred),
+            "RMSE": np.sqrt(mean_squared_error(y_test, pred)),
+            "R2": r2_score(y_test, pred)
+        })
+        fitted[name] = pipe
+
+    results_df = pd.DataFrame(results).sort_values("MAE").reset_index(drop=True)
+    best_name = results_df.iloc[0]["Model"]
+
+    return results_df, fitted[best_name], X_train, X_test, y_train, y_test
+
+
+def evaluate_classification_models(X, y):
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.20,
+        random_state=RANDOM_STATE,
+        stratify=y
+    )
+
+    models = {
+        "Logistic Regression": LogisticRegression(
+            max_iter=3000,
+            class_weight="balanced",
+            random_state=RANDOM_STATE
+        ),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=300,
+            min_samples_leaf=2,
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+            n_jobs=-1
+        ),
+        "Extra Trees": ExtraTreesClassifier(
+            n_estimators=300,
+            min_samples_leaf=2,
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+            n_jobs=-1
+        )
+    }
+
+    results = []
+    fitted = {}
+
+    for name, model in models.items():
+        pipe = Pipeline([
+            (
+                "preprocessor",
+                make_preprocessor(
+                    X,
+                    scale_numeric=(name == "Logistic Regression")
+                )
+            ),
+            ("model", model)
+        ])
+
+        pipe.fit(X_train, y_train)
+        pred = pipe.predict(X_test)
+
+        results.append({
+            "Model": name,
+            "Accuracy": accuracy_score(y_test, pred),
+            "Macro Precision": precision_score(
+                y_test, pred, average="macro", zero_division=0
+            ),
+            "Macro Recall": recall_score(
+                y_test, pred, average="macro", zero_division=0
+            ),
+            "Macro F1": f1_score(
+                y_test, pred, average="macro", zero_division=0
+            )
+        })
+        fitted[name] = pipe
+
+    results_df = pd.DataFrame(results).sort_values(
+        "Macro F1", ascending=False
+    ).reset_index(drop=True)
+
+    best_name = results_df.iloc[0]["Model"]
+
+    return results_df, fitted[best_name], X_train, X_test, y_train, y_test
+
+
+def plot_permutation_importance(
+    model, X_test, y_test, scoring, title, top_n=12
+):
+    result = permutation_importance(
+        model,
+        X_test,
+        y_test,
+        n_repeats=8,
+        random_state=RANDOM_STATE,
+        scoring=scoring,
+        n_jobs=-1
+    )
+
+    importance_df = pd.DataFrame({
+        "Feature": X_test.columns,
+        "Importance": result.importances_mean
+    }).sort_values("Importance", ascending=False)
+
+    plot_df = importance_df.head(top_n).sort_values("Importance")
+
+    plt.figure(figsize=(8, 5))
+    plt.barh(plot_df["Feature"], plot_df["Importance"])
+    plt.xlabel("Mean Decrease in Test-Set Score After Permutation")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+    return importance_df
+```
+
+# Section 3 — RQ1: Can Pre-Sleep Behavior Predict Sleep Latency?
+
+## 3.1 Research Logic
+
+Sleep latency measures how long it takes a person to fall asleep. This question deliberately uses variables that are available before sleep begins. It therefore asks whether bedtime behavior and lifestyle characteristics can predict delayed sleep onset without using later sleep outcomes.
+
+**Task:** Regression  
+**Target:** `sleep_latency_min`  
+**Models:** Ridge Regression, Random Forest, Extra Trees  
+**Primary selection metric:** MAE
+
+```{python}
+pre_sleep_features = [
+    "age",
+    "gender",
+    "occupation_type",
+    "chronotype",
+    "bedtime_phone_minutes",
+    "primary_bedtime_app",
+    "screen_brightness_pct",
+    "blue_light_filter_active",
+    "caffeine_post_5pm_mg",
+    "physical_activity_min"
+]
+
+X_rq1 = df[pre_sleep_features].copy()
+y_rq1 = df["sleep_latency_min"].copy()
+
+rq1_results, rq1_best_model, rq1_X_train, rq1_X_test, rq1_y_train, rq1_y_test = (
+    evaluate_regression_models(X_rq1, y_rq1)
+)
+
+display(rq1_results)
+print("Selected model:", rq1_results.iloc[0]["Model"])
+```
+
+## 3.2 Observed Relationship Between Phone Use and Sleep Latency
+
+This plot is included because bedtime phone duration is a central behavioral variable and the relationship is directly relevant to the research question.
+
+```{python}
+phone_bins = pd.qcut(
+    df["bedtime_phone_minutes"],
+    q=6,
+    duplicates="drop"
+)
+
+rq1_plot = (
+    df.assign(phone_bin=phone_bins)
+      .groupby("phone_bin", observed=False)
+      .agg(
+          avg_phone_minutes=("bedtime_phone_minutes", "mean"),
+          avg_sleep_latency=("sleep_latency_min", "mean")
+      )
+      .reset_index()
+)
+
+plt.figure(figsize=(8, 5))
+plt.plot(
+    rq1_plot["avg_phone_minutes"],
+    rq1_plot["avg_sleep_latency"],
+    marker="o"
+)
+plt.xlabel("Average Bedtime Phone Minutes")
+plt.ylabel("Average Sleep Latency (Minutes)")
+plt.title("Bedtime Phone Use and Average Sleep Latency")
+plt.grid(alpha=0.25)
+plt.tight_layout()
+plt.show()
+```
+
+## 3.3 Feature Importance
+
+Permutation importance measures how much the selected model's test performance deteriorates when one original feature is randomly shuffled.
+
+```{python}
+rq1_importance = plot_permutation_importance(
+    rq1_best_model,
+    rq1_X_test,
+    rq1_y_test,
+    scoring="neg_mean_absolute_error",
+    title="RQ1 — Feature Importance for Sleep Latency"
+)
+
+display(rq1_importance.head(12))
+```
+
+## 3.4 Interpretation Guide
+
+A lower MAE and RMSE indicate better predictions, while a higher R² indicates that more variation in sleep latency is explained by the model. The permutation-importance chart identifies the variables that contribute most to out-of-sample predictive performance.
+
+The analysis should be described as **predictive association**, not causal evidence. For example, if bedtime phone minutes are highly important, this means they help predict sleep latency in this dataset; it does not by itself prove that reducing phone use would cause an equivalent reduction in latency.
+
+
+# RQ1 Models Performance Analysis
+
+Random Forest achieved the best overall performance, with the lowest MAE (5.47) and RMSE (6.90) and the highest R² (0.852). Its predictions of sleep latency were therefore off by approximately 5.5 minutes on average, while the model explained about 85.2% of the variation in sleep latency.
+
+Ridge Regression and Extra Trees also performed well, with R² values above 0.84, suggesting that the selected pre-sleep and lifestyle variables contain substantial predictive information about sleep latency. The differences among the three models were relatively small, but Random Forest consistently performed best across all evaluation metrics. Its slight advantage over Ridge Regression may indicate that some relationships between bedtime behaviors and sleep latency are nonlinear or involve interactions among predictors.
+
+Based on these results, Random Forest is selected as the final model for RQ1. Feature importance can then be examined to identify which pre-sleep and lifestyle factors contribute most to predicting sleep latency.
+
+
+
+# RQ1 Feature Importance Analysis
+
+The feature importance results show that bedtime phone use was the dominant predictor of sleep latency. `bedtime_phone_minutes` had by far the highest permutation importance (11.79), indicating that the Random Forest model relied heavily on the amount of time spent on the phone before sleep.
+
+`primary_bedtime_app` (1.68) and `caffeine_post_5pm_mg` (1.23) were the next most important predictors, suggesting that both the type of bedtime phone activity and evening caffeine consumption provide additional information for predicting sleep latency. Screen brightness also contributed to the model, although its importance was considerably smaller.
+
+In contrast, blue-light filter use, age, gender, occupation type, physical activity, and chronotype showed relatively low predictive importance. Overall, the results suggest that bedtime phone behavior—particularly the duration of phone use—is the strongest source of predictive information for sleep latency in this dataset. These findings represent predictive associations and should not be interpreted as evidence of causal effects.
+
+
+
+
+
+# Section 4 — RQ2: Can Pre-Sleep Behavior Predict Total Sleep Duration?
+
+## 4.1 Research Logic
+
+This question shifts from sleep onset to sleep quantity. It tests whether the same pre-sleep information can predict how many hours a person sleeps.
+
+**Task:** Regression  
+**Target:** `total_sleep_hours`  
+**Models:** Ridge Regression, Random Forest, Extra Trees  
+**Primary selection metric:** MAE
+
+```{python}
+X_rq2 = df[pre_sleep_features].copy()
+y_rq2 = df["total_sleep_hours"].copy()
+
+rq2_results, rq2_best_model, rq2_X_train, rq2_X_test, rq2_y_train, rq2_y_test = (
+    evaluate_regression_models(X_rq2, y_rq2)
+)
+
+display(rq2_results)
+print("Selected model:", rq2_results.iloc[0]["Model"])
+```
+
+## 4.2 Phone Use and Average Sleep Duration
+
+```{python}
+rq2_plot = (
+    df.assign(
+        phone_bin=pd.qcut(
+            df["bedtime_phone_minutes"],
+            q=6,
+            duplicates="drop"
+        )
+    )
+    .groupby("phone_bin", observed=False)
+    .agg(
+        avg_phone_minutes=("bedtime_phone_minutes", "mean"),
+        avg_sleep_hours=("total_sleep_hours", "mean")
+    )
+    .reset_index()
+)
+
+plt.figure(figsize=(8, 5))
+plt.plot(
+    rq2_plot["avg_phone_minutes"],
+    rq2_plot["avg_sleep_hours"],
+    marker="o"
+)
+plt.xlabel("Average Bedtime Phone Minutes")
+plt.ylabel("Average Total Sleep Hours")
+plt.title("Bedtime Phone Use and Average Sleep Duration")
+plt.grid(alpha=0.25)
+plt.tight_layout()
+plt.show()
+```
+
+## 4.3 Feature Importance
+
+```{python}
+rq2_importance = plot_permutation_importance(
+    rq2_best_model,
+    rq2_X_test,
+    rq2_y_test,
+    scoring="neg_mean_absolute_error",
+    title="RQ2 — Feature Importance for Total Sleep Duration"
+)
+
+display(rq2_importance.head(12))
+```
+
+## 4.4 Interpretation Guide
+
+RQ1 and RQ2 should be interpreted together. A variable may be useful for predicting delayed sleep onset but less useful for predicting total sleep duration, or vice versa. This distinction helps avoid treating "sleep quality" as a single outcome.
+
+
+
+
+# RQ2 Models Performance Analysis
+
+Ridge Regression achieved the best overall performance for predicting total sleep duration, with the lowest MAE (0.516) and RMSE (0.640) and the highest R² (0.811). The MAE corresponds to an average prediction error of approximately 0.52 hours, or about 31 minutes, while the model explained approximately 81.1% of the variation in total sleep hours.
+
+Random Forest performed very similarly, with an MAE of 0.519 and an R² of 0.804, indicating that the difference between the two models was relatively small. Extra Trees also demonstrated substantial predictive ability but produced slightly higher errors and a lower R².
+
+Unlike RQ1, where Random Forest performed best, Ridge Regression achieved the strongest results for total sleep duration. This suggests that the predictive structure of total sleep hours may be relatively well captured by a simpler linear model. Based on the overall evaluation metrics, Ridge Regression is selected as the final model for RQ2.
+
+
+
+
+# RQ2 Feature Importance Analysis
+
+The feature importance results reveal a different predictive pattern from RQ1. Chronotype was the most important predictor of total sleep duration (0.639), followed by bedtime phone minutes (0.529) and occupation type (0.206). This suggests that sleep duration is predicted more strongly by an individual's sleep-wake preference and bedtime phone duration than by most other measured characteristics.
+
+Bedtime phone minutes remained an important predictor across both RQ1 and RQ2, making it one of the most consistent behavioral predictors in the analysis. However, other variables showed substantial differences between the two outcomes. Evening caffeine consumption, primary bedtime app, and screen brightness were more informative for predicting sleep latency but contributed relatively little to predicting total sleep duration.
+
+The remaining variables, including age, gender, blue-light filter use, and physical activity, provided little additional predictive information for the RQ2 model. Physical activity had a very small negative permutation importance (-0.000048). This does not indicate that physical activity has a negative effect on sleep duration. Instead, the value is effectively zero and means that randomly shuffling this feature did not reduce the model's predictive performance. Such a small negative value can occur because of random variation, overlapping information among predictors, or model estimation noise.
+
+Overall, these results suggest that different sleep outcomes have distinct predictive patterns, while bedtime phone duration remains relevant across both sleep latency and total sleep duration.
+
+
+
+
+
+
+
+# Section 5 — RQ3: Can Pre-Sleep and Lifestyle Variables Classify Sleep Debt?
+
+## 5.1 Research Logic
+
+The dataset contains four sleep-debt categories:
+
+- Optimal Recovery
+- Mild Deficit
+- Moderate Debt
+- Severe Sleep Debt
+
+A tempting approach would be to include `total_sleep_hours` as a predictor. However, sleep-debt labels may be directly or indirectly defined from sleep duration, which would make the classification artificially easy and less useful.
+
+Therefore, this model uses only pre-sleep and lifestyle variables. The question becomes: **Can risk of sleep debt be recognized before using the night's realized sleep outcomes?**
+
+**Task:** Multiclass classification  
+**Target:** `sleep_debt_category`  
+**Models:** Multinomial-capable Logistic Regression, Random Forest, Extra Trees  
+**Primary selection metric:** Macro F1
+
+```{python}
+X_rq3 = df[pre_sleep_features].copy()
+y_rq3 = df["sleep_debt_category"].copy()
+
+rq3_results, rq3_best_model, rq3_X_train, rq3_X_test, rq3_y_train, rq3_y_test = (
+    evaluate_classification_models(X_rq3, y_rq3)
+)
+
+display(rq3_results)
+print("Selected model:", rq3_results.iloc[0]["Model"])
+```
+
+Macro F1 is emphasized because it gives equal weight to each class and is more informative than accuracy when class frequencies differ.
+
+## 5.2 Classification Report and Confusion Matrix
+
+```{python}
+rq3_pred = rq3_best_model.predict(rq3_X_test)
+
+print(classification_report(rq3_y_test, rq3_pred, zero_division=0))
+
+fig, ax = plt.subplots(figsize=(8, 6))
+ConfusionMatrixDisplay.from_predictions(
+    rq3_y_test,
+    rq3_pred,
+    xticks_rotation=30,
+    cmap="Blues",
+    ax=ax
+)
+ax.set_title("RQ3 — Confusion Matrix for Selected Sleep-Debt Model")
+plt.tight_layout()
+plt.show()
+```
+
+## 5.3 Feature Importance
+
+```{python}
+rq3_importance = plot_permutation_importance(
+    rq3_best_model,
+    rq3_X_test,
+    rq3_y_test,
+    scoring="f1_macro",
+    title="RQ3 — Feature Importance for Sleep-Debt Classification"
+)
+
+display(rq3_importance.head(12))
+```
+
+## 5.4 Interpretation Guide
+
+If classification performance is strong, the result suggests that pre-sleep behavior contains meaningful information about sleep-debt risk. If performance is weak, that is also an important result: sleep debt may depend heavily on realized sleep duration or other information not available in the pre-sleep variables.
+
+This design intentionally prioritizes a realistic and leakage-resistant question over obtaining an artificially high classification score.
+
+
+
+# RQ3 Models Performance Analysis
+
+Logistic Regression achieved the best Macro F1 score (0.673), although its overall performance was very close to Random Forest. Random Forest produced a slightly higher accuracy (69.6% versus 69.4%) and Macro Precision, while Logistic Regression achieved the highest Macro Recall (0.736) and Macro F1. Since Macro F1 was selected as the primary evaluation metric, Logistic Regression is selected as the final model for RQ3.
+
+The approximately 69% accuracy indicates that pre-sleep behavior and lifestyle characteristics contain meaningful information for distinguishing among the four sleep-debt categories. However, the results also show that these variables alone cannot perfectly identify sleep-debt status.
+
+Importantly, realized sleep outcomes such as total sleep hours and sleep latency were intentionally excluded from the predictors to reduce the risk of data leakage, since sleep-debt categories may be directly related to actual sleep duration. Therefore, the model addresses a more practical question: how well sleep-debt risk can be identified using information available before the night's actual sleep outcomes are known.
+
+Overall, Logistic Regression provides the best balance across the four classes, while Random Forest performs at a very similar level. The classification report and confusion matrix can be used next to determine which sleep-debt categories are easiest to identify and which are most frequently confused.
+
+
+
+# RQ3 Classification Performance Analysis
+
+The classification report shows that Logistic Regression performed differently across the four sleep-debt categories. Moderate Debt achieved the highest F1 score (0.78) and a particularly high precision of 0.89, indicating that predictions assigned to this category were generally reliable. However, its recall of 0.69 shows that some actual Moderate Debt cases were classified into other categories.
+
+Severe Sleep Debt showed a different pattern, with the highest recall (0.91) but a lower precision (0.54). The model therefore identified most actual Severe Sleep Debt cases, but it also incorrectly assigned some observations from other categories to this class. Optimal Recovery showed relatively balanced performance, with a precision of 0.63, recall of 0.75, and F1 score of 0.69.
+
+Mild Deficit was the most difficult category to classify, producing the lowest F1 score (0.56). Because this category lies between Optimal Recovery and Moderate Debt in terms of sleep-debt severity, its characteristics may overlap more strongly with neighboring categories. The confusion matrix should be examined to determine whether this is the main source of classification errors.
+
+The difference between the Macro F1 (0.67) and Weighted F1 (0.70) also reflects class imbalance. Moderate Debt had 893 observations, while Severe Sleep Debt had only 129. Since Moderate Debt was both the largest and best-performing class, the weighted average is somewhat higher. Macro F1 is therefore more appropriate for evaluating overall performance across all four sleep-debt categories because it gives each category equal importance.
+
+
+
+
+# RQ3 Feature Importance Analysis
+
+The feature importance results show that bedtime phone minutes (0.268) and chronotype (0.250) were the two dominant predictors of sleep-debt category, with substantially higher importance than the remaining variables. Occupation type ranked third (0.059), providing additional but considerably smaller predictive value.
+
+Bedtime phone duration has now emerged as an important predictor across RQ1, RQ2, and RQ3, suggesting that it provides consistent predictive information for sleep latency, total sleep duration, and sleep-debt classification. Chronotype shows a different pattern: it contributed little to sleep-latency prediction in RQ1 but was highly important for both total sleep duration and sleep-debt classification.
+
+Evening caffeine intake, screen brightness, and primary bedtime app provided some additional predictive information, but their importance was relatively small in RQ3. Blue-light filter use also contributed little to the model.
+
+Age and physical activity had slightly negative permutation importance values. These values are extremely close to zero and should not be interpreted as negative effects on sleep debt. Instead, they indicate that randomly shuffling these variables did not reduce model performance. Small negative permutation importance values can occur because of random variation, overlapping information among predictors, or model estimation noise.
+
+Overall, the results identify bedtime phone duration and chronotype as the primary predictors of sleep-debt category, while bedtime phone duration also stands out as the most consistent predictor across the first three research questions.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Section 6 — RQ4: How Much Does Actual Sleep Information Improve Next-Day Fatigue Prediction?
+
+## 6.1 Research Logic
+
+This question is intentionally comparative.
+
+**Model A — Behavioral-only:** Uses information available before sleep.  
+**Model B — Behavioral + sleep outcomes:** Adds sleep latency, sleep duration, sleep-stage percentages, and alarm snoozes.
+
+This comparison answers a more useful question than simply asking whether fatigue can be predicted: **How much additional predictive value comes from knowing what actually happened during the night?**
+
+`sleep_debt_category` is excluded because it may summarize sleep duration and could duplicate information already represented by the sleep variables.
+
+**Task:** Regression  
+**Target:** `next_day_fatigue_score`  
+**Models:** Ridge Regression, Random Forest, Extra Trees  
+**Primary selection metric:** MAE
+
+## 6.2 Behavioral-Only Models
+
+```{python}
+X_rq4_behavior = df[pre_sleep_features].copy()
+y_rq4 = df["next_day_fatigue_score"].copy()
+
+(
+    rq4_behavior_results,
+    rq4_behavior_best,
+    rq4b_X_train,
+    rq4b_X_test,
+    rq4b_y_train,
+    rq4b_y_test
+) = evaluate_regression_models(X_rq4_behavior, y_rq4)
+
+display(rq4_behavior_results)
+```
+
+
+## RQ4 — Behavioral-Only Model Analysis
+
+Using only pre-sleep behavior and lifestyle information, Random Forest achieved the best overall performance for predicting next-day fatigue, with the lowest MAE (0.890) and RMSE (1.181) and the highest R² (0.813). This means that the model's fatigue predictions differed from the actual scores by approximately 0.89 points on average, while explaining about 81.3% of the variation in next-day fatigue.
+
+Extra Trees performed similarly, with an MAE of 0.906 and an R² of 0.804, while Ridge Regression produced the highest prediction error. The modest advantage of Random Forest suggests that nonlinear relationships or interactions among pre-sleep behaviors may provide useful predictive information beyond a purely linear structure.
+
+Importantly, these results were obtained without using actual sleep outcomes such as sleep duration, sleep latency, or sleep-stage percentages. Therefore, the behavioral-only model provides a strong baseline for RQ4. The next step is to compare this baseline with models that include actual sleep outcomes to determine how much additional predictive value overnight sleep information provides.
+
+
+
+
+## 6.3 Behavioral + Sleep-Outcome Models
+
+```{python}
+sleep_outcome_features = [
+    "sleep_latency_min",
+    "total_sleep_hours",
+    "deep_sleep_pct",
+    "rem_sleep_pct",
+    "morning_alarm_snoozes"
+]
+
+rq4_full_features = pre_sleep_features + sleep_outcome_features
+
+X_rq4_full = df[rq4_full_features].copy()
+
+(
+    rq4_full_results,
+    rq4_full_best,
+    rq4f_X_train,
+    rq4f_X_test,
+    rq4f_y_train,
+    rq4f_y_test
+) = evaluate_regression_models(X_rq4_full, y_rq4)
+
+display(rq4_full_results)
+```
+
+
+## RQ4 — Behavior + Sleep Outcomes Model Analysis
+
+After actual sleep outcomes were added to the predictors, model performance improved substantially. Random Forest achieved the lowest MAE (0.426), while Extra Trees produced the slightly lowest RMSE (0.601) and highest R² (0.952). The differences between these two models were extremely small. Since MAE was used as the primary regression model-selection metric, Random Forest is selected as the final model.
+
+Compared with the behavioral-only Random Forest model, adding actual sleep outcomes reduced MAE from 0.890 to 0.426, representing an improvement of approximately 52%. RMSE also decreased from 1.181 to 0.602, while R² increased from 0.813 to 0.951. Therefore, the expanded model explained approximately 95.1% of the variation in next-day fatigue.
+
+These results show that pre-sleep behaviors already provide substantial predictive information about next-day fatigue, but actual overnight sleep outcomes add considerable predictive value. In other words, information about behavior before sleep provides a strong baseline, while knowing what actually occurred during sleep substantially improves the accuracy of next-day fatigue prediction. These results represent predictive relationships and should not be interpreted as evidence of causation.
+
+
+
+
+## 6.4 Compare the Best Behavioral and Full Models
+
+```{python}
+rq4_comparison = pd.DataFrame([
+    {
+        "Feature Set": "Behavioral Only",
+        "Best Model": rq4_behavior_results.iloc[0]["Model"],
+        "MAE": rq4_behavior_results.iloc[0]["MAE"],
+        "RMSE": rq4_behavior_results.iloc[0]["RMSE"],
+        "R2": rq4_behavior_results.iloc[0]["R2"]
+    },
+    {
+        "Feature Set": "Behavior + Sleep Outcomes",
+        "Best Model": rq4_full_results.iloc[0]["Model"],
+        "MAE": rq4_full_results.iloc[0]["MAE"],
+        "RMSE": rq4_full_results.iloc[0]["RMSE"],
+        "R2": rq4_full_results.iloc[0]["R2"]
+    }
+])
+
+display(rq4_comparison)
+
+mae_improvement_pct = (
+    (
+        rq4_comparison.loc[0, "MAE"] -
+        rq4_comparison.loc[1, "MAE"]
+    )
+    / rq4_comparison.loc[0, "MAE"]
+    * 100
+)
+
+print(
+    f"MAE improvement after adding sleep outcomes: "
+    f"{mae_improvement_pct:.2f}%"
+)
+```
+
+## 6.5 Meaningful Comparison Plot
+
+```{python}
+plt.figure(figsize=(7, 4.5))
+plt.bar(
+    rq4_comparison["Feature Set"],
+    rq4_comparison["MAE"]
+)
+plt.ylabel("Test MAE")
+plt.title("RQ4 — Fatigue Prediction Error by Available Information")
+plt.xticks(rotation=15)
+plt.tight_layout()
+plt.show()
+```
+
+## 6.6 Feature Importance for the Best Full Model
+
+```{python}
+rq4_importance = plot_permutation_importance(
+    rq4_full_best,
+    rq4f_X_test,
+    rq4f_y_test,
+    scoring="neg_mean_absolute_error",
+    title="RQ4 — Feature Importance for Next-Day Fatigue"
+)
+
+display(rq4_importance.head(15))
+```
+
+## 6.7 Interpretation Guide
+
+The difference between the two feature sets is substantively important:
+
+- If the full model improves substantially, actual sleep outcomes contain information that pre-sleep behavior alone cannot capture.
+- If the improvement is small, bedtime behavior may already encode much of the information needed to predict next-day fatigue.
+- Feature importance in the full model shows whether fatigue is driven more strongly by behavioral variables or by realized sleep characteristics from a predictive perspective.
+
+
+## RQ4 — Behavior + Sleep Outcomes Feature Importance Analysis
+
+The feature importance results help explain the substantial improvement observed after actual sleep outcomes were added to the fatigue prediction model. Total sleep hours was by far the most important predictor (1.332), followed by morning alarm snoozes (0.452) and sleep latency (0.424). These results indicate that actual sleep duration and other sleep-related outcomes provide substantial additional information for predicting next-day fatigue.
+
+Deep sleep percentage provided some additional predictive value (0.053), while REM sleep percentage contributed very little once the other predictors were included. This does not imply that REM sleep is unimportant physiologically; rather, it indicates that REM sleep percentage provided little additional predictive information beyond the other variables already available to the model.
+
+Evening caffeine intake also retained some predictive importance (0.039). In contrast, bedtime phone minutes, which had been an important predictor in earlier research questions, showed much lower importance (0.011) after actual sleep outcomes were included. One possible explanation is that behavioral variables such as bedtime phone use contain useful information when actual sleep outcomes are unknown, but their additional predictive contribution becomes smaller once more direct sleep measures such as total sleep duration and sleep latency are available.
+
+Morning alarm snoozes should also be interpreted as a predictive indicator rather than a causal factor. Because snoozing occurs after the overnight sleep period, greater fatigue may itself be associated with more frequent snoozing. Similarly, the importance values describe contributions to predictive performance and do not establish causal effects.
+
+Overall, RQ4 shows that pre-sleep behavior provides a strong baseline for predicting next-day fatigue, while actual sleep outcomes substantially improve prediction. Total sleep duration, morning alarm snoozes, and sleep latency emerge as the most informative predictors in the expanded model.
+
+
+
+
+
+
+
+
+# Section 7 — RQ5: Can Unsupervised Learning Identify Distinct Bedtime and Sleep Profiles?
+
+## 7.1 Research Logic
+
+The previous questions use known targets. This final question uses unsupervised learning to discover recurring behavioral and sleep profiles without imposing an outcome label.
+
+To prevent variables with large numeric scales from dominating the clusters, all clustering features are standardized.
+
+**Task:** Clustering  
+**Model:** K-Means  
+**Cluster selection:** Elbow Method + Silhouette Score
+
+Categorical variables are not included in the clustering algorithm because the goal is to build compact quantitative profiles. They can still be compared across the resulting clusters afterward.
+
+```{python}
+cluster_features = [
+    "age",
+    "bedtime_phone_minutes",
+    "screen_brightness_pct",
+    "blue_light_filter_active",
+    "caffeine_post_5pm_mg",
+    "physical_activity_min",
+    "sleep_latency_min",
+    "total_sleep_hours",
+    "deep_sleep_pct",
+    "rem_sleep_pct",
+    "morning_alarm_snoozes",
+    "next_day_fatigue_score"
+]
+
+cluster_data = df[cluster_features].copy()
+
+scaler = StandardScaler()
+cluster_scaled = scaler.fit_transform(cluster_data)
+```
+
+## 7.2 Elbow and Silhouette Analysis
+
+```{python}
+k_values = range(2, 9)
+inertias = []
+silhouettes = []
+
+for k in k_values:
+    km = KMeans(
+        n_clusters=k,
+        random_state=RANDOM_STATE,
+        n_init=20
+    )
+    labels = km.fit_predict(cluster_scaled)
+
+    inertias.append(km.inertia_)
+    silhouettes.append(
+        silhouette_score(
+            cluster_scaled,
+            labels,
+            sample_size=min(4000, len(df)),
+            random_state=RANDOM_STATE
+        )
+    )
+
+cluster_selection = pd.DataFrame({
+    "k": list(k_values),
+    "Inertia": inertias,
+    "Silhouette": silhouettes
+})
+
+display(cluster_selection)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+
+axes[0].plot(
+    cluster_selection["k"],
+    cluster_selection["Inertia"],
+    marker="o"
+)
+axes[0].set_title("Elbow Method")
+axes[0].set_xlabel("Number of Clusters (k)")
+axes[0].set_ylabel("Inertia")
+
+axes[1].plot(
+    cluster_selection["k"],
+    cluster_selection["Silhouette"],
+    marker="o"
+)
+axes[1].set_title("Silhouette Score")
+axes[1].set_xlabel("Number of Clusters (k)")
+axes[1].set_ylabel("Silhouette Score")
+
+plt.tight_layout()
+plt.show()
+```
+
+
+
+
+## 7.3 Fit the Final K-Means Model
+
+
+
+```{python}
+# Final cluster selection
+# Although k=2 achieved the highest silhouette score,
+# k=3 is selected as a practical balance between
+# cluster separation and interpretability.
+
+best_k = 3
+
+print("Selected k for final clustering:", best_k)
+
+final_kmeans = KMeans(
+    n_clusters=best_k,
+    random_state=RANDOM_STATE,
+    n_init=20
+)
+
+df["behavior_cluster"] = final_kmeans.fit_predict(cluster_scaled)
+
+print("\nCluster sizes:")
+print(
+    df["behavior_cluster"]
+    .value_counts()
+    .sort_index()
+)
+
+```
+
+
+
+
+
+
+## 7.4 Cluster Profiles
+
+```{python}
+cluster_profiles = (
+    df.groupby("behavior_cluster")[cluster_features]
+      .mean()
+      .round(2)
+)
+
+cluster_sizes = (
+    df["behavior_cluster"]
+      .value_counts()
+      .sort_index()
+      .rename("Count")
+      .to_frame()
+)
+
+display(cluster_sizes)
+display(cluster_profiles)
+```
+
+
+## RQ5 — Behavioral Profile Analysis
+
+Although k = 2 achieved the highest silhouette score, k = 3 was selected as a practical balance between statistical separation and interpretability. The three-cluster solution produced sufficiently large groups and revealed distinct, interpretable patterns in bedtime behavior and sleep outcomes.
+
+Cluster 0, representing 2,379 observations, can be characterized as a **High Phone Use / Poor Sleep Profile**. This group had the highest bedtime phone use (100.61 minutes), longest sleep latency (58.99 minutes), shortest total sleep duration (4.72 hours), most morning alarm snoozes (4.68), and highest next-day fatigue score (7.12). These characteristics form a consistent pattern of intensive bedtime phone use combined with poorer sleep outcomes and greater next-day fatigue.
+
+Cluster 1, with 1,446 observations, can be described as a **High Evening Caffeine / Moderate Sleep Profile**. Its most distinctive characteristic was evening caffeine consumption (111.99 mg), which was substantially higher than in the other two clusters. This group showed intermediate sleep latency (42.66 minutes), total sleep duration (6.40 hours), morning snoozes (2.73), and next-day fatigue (3.99).
+
+Cluster 2 was the largest group, containing 4,675 observations, and can be characterized as a **Lower-Risk Behavior / Better Sleep Profile**. It had the lowest bedtime phone use (41.19 minutes) and evening caffeine consumption (12.48 mg), as well as the shortest sleep latency (30.74 minutes), longest total sleep duration (7.01 hours), highest deep-sleep percentage (22.92%), fewest morning snoozes (1.80), and lowest next-day fatigue score (2.04).
+
+In contrast, age, physical activity, screen brightness, and blue-light filter use showed relatively small differences across the three clusters, suggesting that they were not the primary characteristics distinguishing the profiles.
+
+Overall, the three-cluster solution reveals meaningful differences in bedtime behavior and sleep outcomes. The patterns also complement the supervised-learning results, particularly the recurring importance of bedtime phone use across multiple sleep outcomes. However, these clusters represent descriptive associations and should not be interpreted as evidence that any specific behavior causes the observed sleep outcomes.
+
+
+
+
+## 7.5 Standardized Cluster Heatmap
+
+This chart is useful because the clustering variables have different units. Standardized cluster means reveal which characteristics are unusually high or low within each profile.
+
+```{python}
+profile_z = pd.DataFrame(
+    cluster_scaled,
+    columns=cluster_features
+).assign(
+    behavior_cluster=df["behavior_cluster"].values
+).groupby("behavior_cluster").mean()
+
+fig, ax = plt.subplots(
+    figsize=(12, max(3.5, best_k * 0.8))
+)
+
+im = ax.imshow(
+    profile_z,
+    aspect="auto",
+    cmap="coolwarm",
+    vmin=-2,
+    vmax=2
+)
+
+ax.set_xticks(range(len(cluster_features)))
+ax.set_xticklabels(
+    cluster_features,
+    rotation=70,
+    ha="right"
+)
+ax.set_yticks(range(best_k))
+ax.set_yticklabels(
+    [f"Cluster {i}" for i in profile_z.index]
+)
+fig.colorbar(im, ax=ax, label="Standardized Mean (Z-Score)")
+ax.set_title("RQ5 — Standardized Behavioral and Sleep Cluster Profiles")
+
+plt.tight_layout()
+plt.show()
+```
+
+## 7.6 Two-Dimensional PCA Visualization
+
+PCA is used only for visualization. K-Means itself is fitted on the full standardized feature set.
+
+```{python}
+pca = PCA(n_components=2, random_state=RANDOM_STATE)
+cluster_pca = pca.fit_transform(cluster_scaled)
+
+plt.figure(figsize=(8, 6))
+scatter = plt.scatter(
+    cluster_pca[:, 0],
+    cluster_pca[:, 1],
+    c=df["behavior_cluster"],
+    cmap="tab10",
+    alpha=0.45,
+    s=18
+)
+
+plt.xlabel(
+    f"PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}% variance)"
+)
+plt.ylabel(
+    f"PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}% variance)"
+)
+plt.title("RQ5 — PCA View of K-Means Behavioral Profiles")
+plt.colorbar(scatter, label="Cluster")
+plt.tight_layout()
+plt.show()
+```
+
+## 7.7 Sleep-Debt Composition by Cluster
+
+The sleep-debt label is not used to create the clusters. It is examined afterward to understand whether the discovered profiles differ in sleep-debt composition.
+
+```{python}
+
+# Define the logical order of sleep-debt categories
+sleep_debt_order = [
+    "Optimal Recovery",
+    "Mild Deficit",
+    "Moderate Debt",
+    "Severe Sleep Debt"
+]
+
+# Calculate the proportion of each sleep-debt category within each cluster
+cluster_debt_share = pd.crosstab(
+    df["behavior_cluster"],
+    df["sleep_debt_category"],
+    normalize="index"
+)
+
+# Reorder columns from lowest to highest sleep-debt severity
+cluster_debt_share = (
+    cluster_debt_share
+    .reindex(columns=sleep_debt_order)
+    .round(3)
+)
+
+display(cluster_debt_share)
+
+# Plot using the same logical category order
+cluster_debt_share.plot(
+    kind="bar",
+    stacked=True,
+    figsize=(9, 5)
+)
+
+plt.ylabel("Share Within Cluster")
+plt.xlabel("Behavior Cluster")
+plt.title("Sleep-Debt Composition Across Discovered Clusters")
+
+plt.legend(
+    title="Sleep Debt",
+    bbox_to_anchor=(1.02, 1),
+    loc="upper left"
+)
+
+plt.tight_layout()
+plt.show()
+
+
+
+```
+
+## 7.8 Interpretation Guide
+
+Clusters should be named only **after** examining their standardized profiles. Examples of possible descriptive labels might include high-screen/high-fatigue, lower-screen/better-recovery, or caffeine-related profiles, but the final labels must be based on the actual output rather than assumed in advance.
+
+
+
+
+
+
+
+# Section 8 — Consolidated Model Comparison
+
+This section collects the selected supervised models in one table.
+
+```{python}
+final_model_summary = pd.DataFrame([
+    {
+        "Research Question": "RQ1 — Sleep Latency",
+        "Task": "Regression",
+        "Selected Model": rq1_results.iloc[0]["Model"],
+        "Primary Metric": "MAE",
+        "Primary Score": rq1_results.iloc[0]["MAE"]
+    },
+    {
+        "Research Question": "RQ2 — Total Sleep Hours",
+        "Task": "Regression",
+        "Selected Model": rq2_results.iloc[0]["Model"],
+        "Primary Metric": "MAE",
+        "Primary Score": rq2_results.iloc[0]["MAE"]
+    },
+    {
+        "Research Question": "RQ3 — Sleep Debt Category",
+        "Task": "Multiclass Classification",
+        "Selected Model": rq3_results.iloc[0]["Model"],
+        "Primary Metric": "Macro F1",
+        "Primary Score": rq3_results.iloc[0]["Macro F1"]
+    },
+    {
+        "Research Question": "RQ4 — Next-Day Fatigue (Behavior + Sleep Outcomes)",
+        "Task": "Regression",
+        "Selected Model": rq4_full_results.iloc[0]["Model"],
+        "Primary Metric": "MAE",
+        "Primary Score": rq4_full_results.iloc[0]["MAE"]
+    },
+    {
+        "Research Question": "RQ5 — Behavioral Profiles",
+        "Task": "Clustering",
+        "Selected Model": f"K-Means (k={best_k})",
+        "Primary Metric": "Silhouette (Selected k)",
+        "Primary Score": cluster_selection.loc[
+            cluster_selection["k"] == best_k,
+            "Silhouette"
+        ].iloc[0]
+    }
+])
+
+display(final_model_summary)
+```
+
+
+
